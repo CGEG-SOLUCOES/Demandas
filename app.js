@@ -1,0 +1,479 @@
+// ============================================================
+//  app.js — lógica principal do CGEG Controle de Demandas
+// ============================================================
+
+// ── Estado global ──────────────────────────────────────────
+let currentUser   = null;
+let allDemandas   = [];
+let editingId     = null;
+let chartsReady   = false;
+let chartStatus   = null;
+let chartArea     = null;
+
+// ── Utilitários ────────────────────────────────────────────
+function fmt(date) {
+  if (!date) return '—';
+  if (date.toDate) date = date.toDate();
+  return new Intl.DateTimeFormat('pt-BR').format(new Date(date));
+}
+
+function toast(msg, type = 'success') {
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.innerHTML = `<span>${type === 'success' ? '✓' : '✕'}</span> ${msg}`;
+  document.getElementById('toast-container').appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+
+function badgePrioridade(p) {
+  const map = { Urgente: 'urgente', Alta: 'alta', Média: 'media', Baixa: 'baixa' };
+  return `<span class="badge badge-${map[p] || 'baixa'}">${p || '—'}</span>`;
+}
+
+function badgeStatus(s) {
+  const map = {
+    'Concluída':   'concluida',
+    'Em Andamento':'andamento',
+    'Em Revisão':  'revisao',
+    'Pausada':     'pausada'
+  };
+  return `<span class="badge badge-${map[s] || 'pausada'}">${s || '—'}</span>`;
+}
+
+function progressBar(pct) {
+  const v = Math.round((pct || 0) * 100);
+  const color = v >= 100 ? 'var(--green)' : v >= 50 ? 'var(--accent)' : 'var(--amber)';
+  return `
+    <div class="progress-wrap">
+      <div class="progress-bar">
+        <div class="progress-fill" style="width:${v}%;background:${color}"></div>
+      </div>
+      <span class="progress-pct">${v}%</span>
+    </div>`;
+}
+
+function dotColor(status) {
+  const map = {
+    'Concluída': 'var(--green)',
+    'Em Andamento': 'var(--accent)',
+    'Em Revisão': 'var(--purple)',
+    'Pausada': 'var(--text3)'
+  };
+  return map[status] || 'var(--text3)';
+}
+
+// ── Navegação ──────────────────────────────────────────────
+function navigate(pageId) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById('page-' + pageId)?.classList.add('active');
+  document.querySelector(`[data-page="${pageId}"]`)?.classList.add('active');
+  if (pageId === 'dashboard') renderDashboard();
+  if (pageId === 'demandas') renderTabela();
+  if (pageId === 'minhas')   renderMinhas();
+}
+
+// ── Autenticação ───────────────────────────────────────────
+function initAuth() {
+  auth.onAuthStateChanged(user => {
+    if (user) {
+      currentUser = user;
+      document.getElementById('login-page').style.display = 'none';
+      document.getElementById('app-page').style.display   = 'grid';
+      document.getElementById('user-name').textContent    = user.displayName || user.email;
+      document.getElementById('user-photo').src = user.photoURL || 'https://ui-avatars.com/api/?name=' + encodeURIComponent(user.displayName || 'U') + '&background=5b8fff&color=fff';
+      loadDemandas();
+    } else {
+      document.getElementById('login-page').style.display = 'flex';
+      document.getElementById('app-page').style.display   = 'none';
+    }
+  });
+}
+
+function loginEmail() {
+  const email = document.getElementById('login-email').value.trim();
+  const senha = document.getElementById('login-senha').value;
+  const erro  = document.getElementById('login-erro');
+  const btn   = document.getElementById('btn-login');
+
+  if (!email || !senha) {
+    erro.style.display = 'block';
+    erro.textContent = 'Preencha o e-mail e a senha.';
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = 'Entrando…';
+  erro.style.display = 'none';
+
+  auth.signInWithEmailAndPassword(email, senha)
+    .catch(err => {
+      erro.style.display = 'block';
+      erro.textContent = 'E-mail ou senha incorretos. Tente novamente.';
+      btn.disabled = false;
+      btn.textContent = 'Entrar';
+    });
+}
+
+function logout() {
+  auth.signOut();
+}
+
+// ── Firestore: carregar em tempo real ─────────────────────
+function loadDemandas() {
+  db.collection('demandas')
+    .orderBy('criadoEm', 'desc')
+    .onSnapshot(snap => {
+      allDemandas = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      const activePage = document.querySelector('.page.active')?.id?.replace('page-', '');
+      if (activePage === 'dashboard') renderDashboard();
+      if (activePage === 'demandas')  renderTabela();
+      if (activePage === 'minhas')    renderMinhas();
+    }, err => {
+      toast('Erro ao carregar dados: ' + err.message, 'error');
+    });
+}
+
+// ── Dashboard ──────────────────────────────────────────────
+function renderDashboard() {
+  const total     = allDemandas.length;
+  const concluidas = allDemandas.filter(d => d.status === 'Concluída').length;
+  const andamento  = allDemandas.filter(d => d.status === 'Em Andamento').length;
+  const atrasadas  = allDemandas.filter(d => {
+    if (!d.prazo || d.status === 'Concluída') return false;
+    const p = d.prazo.toDate ? d.prazo.toDate() : new Date(d.prazo);
+    return p < new Date();
+  }).length;
+
+  document.getElementById('m-total').textContent     = total;
+  document.getElementById('m-concluidas').textContent = concluidas;
+  document.getElementById('m-andamento').textContent  = andamento;
+  document.getElementById('m-atrasadas').textContent  = atrasadas;
+
+  renderCharts();
+  renderRecentes();
+}
+
+function renderCharts() {
+  if (!window.Chart) return;
+
+  // Gráfico de status
+  const statusCounts = {
+    'Concluída': 0, 'Em Andamento': 0, 'Em Revisão': 0, 'Pausada': 0
+  };
+  allDemandas.forEach(d => { if (statusCounts[d.status] !== undefined) statusCounts[d.status]++; });
+
+  const ctxStatus = document.getElementById('chart-status').getContext('2d');
+  if (chartStatus) chartStatus.destroy();
+  chartStatus = new Chart(ctxStatus, {
+    type: 'doughnut',
+    data: {
+      labels: Object.keys(statusCounts),
+      datasets: [{
+        data: Object.values(statusCounts),
+        backgroundColor: ['#3ecf8e', '#5b8fff', '#a78bfa', '#555b6e'],
+        borderWidth: 0,
+        hoverOffset: 6
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'right', labels: { color: '#8b90a0', font: { size: 12, family: 'DM Sans' }, boxWidth: 12, padding: 12 } }
+      },
+      cutout: '70%'
+    }
+  });
+
+  // Gráfico de área
+  const areaCounts = {};
+  allDemandas.forEach(d => { areaCounts[d.area] = (areaCounts[d.area] || 0) + 1; });
+
+  const ctxArea = document.getElementById('chart-area').getContext('2d');
+  if (chartArea) chartArea.destroy();
+  chartArea = new Chart(ctxArea, {
+    type: 'bar',
+    data: {
+      labels: Object.keys(areaCounts),
+      datasets: [{
+        data: Object.values(areaCounts),
+        backgroundColor: 'rgba(91,143,255,0.25)',
+        borderColor: '#5b8fff',
+        borderWidth: 1.5,
+        borderRadius: 6
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#8b90a0', font: { size: 12 } }, grid: { color: 'rgba(255,255,255,0.04)' } },
+        y: { ticks: { color: '#8b90a0', font: { size: 12 }, stepSize: 1 }, grid: { color: 'rgba(255,255,255,0.04)' } }
+      }
+    }
+  });
+}
+
+function renderRecentes() {
+  const lista = [...allDemandas]
+    .filter(d => d.status !== 'Concluída')
+    .sort((a, b) => {
+      const ap = a.prazo?.toDate ? a.prazo.toDate() : new Date(a.prazo || 0);
+      const bp = b.prazo?.toDate ? b.prazo.toDate() : new Date(b.prazo || 0);
+      return ap - bp;
+    })
+    .slice(0, 6);
+
+  const el = document.getElementById('lista-recentes');
+  if (!lista.length) { el.innerHTML = '<div class="empty-state"><p>Nenhuma demanda em aberto</p></div>'; return; }
+
+  el.innerHTML = lista.map(d => `
+    <div class="recente-item" onclick="abrirDetalhe('${d.id}')">
+      <div class="recente-dot" style="background:${dotColor(d.status)}"></div>
+      <div class="recente-info">
+        <div class="recente-titulo">${d.titulo || '—'}</div>
+        <div class="recente-meta">${d.responsavel || '—'} · Prazo: ${fmt(d.prazo)}</div>
+      </div>
+      ${badgePrioridade(d.prioridade)}
+    </div>
+  `).join('');
+}
+
+// ── Lista de demandas ──────────────────────────────────────
+function renderTabela(filtros) {
+  filtros = filtros || getFiltros();
+  let lista = [...allDemandas];
+
+  if (filtros.busca) {
+    const b = filtros.busca.toLowerCase();
+    lista = lista.filter(d =>
+      (d.titulo || '').toLowerCase().includes(b) ||
+      (d.atividade || '').toLowerCase().includes(b) ||
+      (d.responsavel || '').toLowerCase().includes(b)
+    );
+  }
+  if (filtros.area)       lista = lista.filter(d => d.area === filtros.area);
+  if (filtros.status)     lista = lista.filter(d => d.status === filtros.status);
+  if (filtros.prioridade) lista = lista.filter(d => d.prioridade === filtros.prioridade);
+
+  const tbody = document.getElementById('tabela-body');
+  document.getElementById('tabela-count').textContent = lista.length + ' demanda' + (lista.length !== 1 ? 's' : '');
+
+  if (!lista.length) {
+    tbody.innerHTML = `<tr><td colspan="7"><div class="empty-state">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+      <p>Nenhuma demanda encontrada</p></div></td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = lista.map(d => `
+    <tr onclick="abrirDetalhe('${d.id}')">
+      <td>
+        <div class="demanda-titulo">${d.titulo || '—'}</div>
+        <div class="demanda-atividade">${d.atividade || ''}</div>
+      </td>
+      <td><span class="badge badge-${(d.area || '').toLowerCase().replace(/[^a-z]/g,'')}">
+        ${d.area || '—'}</span></td>
+      <td>${badgePrioridade(d.prioridade)}</td>
+      <td>${badgeStatus(d.status)}</td>
+      <td style="color:var(--text2);font-size:13px">${d.responsavel || '—'}</td>
+      <td style="color:var(--text2);font-size:13px">${fmt(d.prazo)}</td>
+      <td>${progressBar(d.porcentoConcluido)}</td>
+    </tr>
+  `).join('');
+}
+
+function getFiltros() {
+  return {
+    busca:      document.getElementById('f-busca')?.value || '',
+    area:       document.getElementById('f-area')?.value || '',
+    status:     document.getElementById('f-status')?.value || '',
+    prioridade: document.getElementById('f-prioridade')?.value || ''
+  };
+}
+
+// ── Minhas demandas ────────────────────────────────────────
+function renderMinhas() {
+  const nome = currentUser?.displayName || currentUser?.email || '';
+  const minhas = allDemandas.filter(d =>
+    (d.responsavel || '').toLowerCase().includes(nome.split(' ')[0].toLowerCase()) &&
+    d.status !== 'Concluída'
+  );
+
+  const el = document.getElementById('minhas-lista');
+  if (!minhas.length) {
+    el.innerHTML = '<div class="empty-state"><p>Nenhuma demanda aberta para você</p></div>';
+    return;
+  }
+
+  el.innerHTML = `<div class="table-wrap"><table class="demandas-table">
+    <thead><tr>
+      <th>Demanda</th><th>Prioridade</th><th>Status</th><th>Prazo</th><th>Progresso</th>
+    </tr></thead>
+    <tbody>
+    ${minhas.map(d => `
+      <tr onclick="abrirDetalhe('${d.id}')">
+        <td>
+          <div class="demanda-titulo">${d.titulo || '—'}</div>
+          <div class="demanda-atividade">${d.atividade || ''}</div>
+        </td>
+        <td>${badgePrioridade(d.prioridade)}</td>
+        <td>${badgeStatus(d.status)}</td>
+        <td style="color:var(--text2);font-size:13px">${fmt(d.prazo)}</td>
+        <td>${progressBar(d.porcentoConcluido)}</td>
+      </tr>
+    `).join('')}
+    </tbody>
+  </table></div>`;
+}
+
+// ── Formulário: novo / editar ──────────────────────────────
+function abrirFormulario(id) {
+  editingId = id || null;
+  const d = id ? allDemandas.find(x => x.id === id) : null;
+  document.getElementById('modal-form-title').textContent = d ? 'Editar demanda' : 'Nova demanda';
+
+  const campos = ['titulo','descricao','atividade','area','tipo','prioridade','status','responsavel','apoio','prazo','entregavel','observacoes'];
+  campos.forEach(c => {
+    const el = document.getElementById('f-' + c);
+    if (!el) return;
+    if (c === 'prazo' && d?.prazo) {
+      const dt = d.prazo.toDate ? d.prazo.toDate() : new Date(d.prazo);
+      el.value = dt.toISOString().split('T')[0];
+    } else {
+      el.value = d?.[c] || '';
+    }
+  });
+
+  const pct = Math.round((d?.porcentoConcluido || 0) * 100);
+  document.getElementById('f-pct').value = pct;
+  document.getElementById('f-pct-display').textContent = pct + '%';
+
+  document.getElementById('modal-form').classList.add('open');
+}
+
+async function salvarDemanda() {
+  const titulo = document.getElementById('f-titulo').value.trim();
+  if (!titulo) { toast('O título é obrigatório', 'error'); return; }
+
+  const prazoVal = document.getElementById('f-prazo').value;
+  const pct = parseInt(document.getElementById('f-pct').value) / 100;
+
+  const data = {
+    titulo,
+    descricao:        document.getElementById('f-descricao').value,
+    atividade:        document.getElementById('f-atividade').value,
+    area:             document.getElementById('f-area').value,
+    tipo:             document.getElementById('f-tipo').value,
+    prioridade:       document.getElementById('f-prioridade').value,
+    status:           document.getElementById('f-status').value,
+    responsavel:      document.getElementById('f-responsavel').value,
+    apoio:            document.getElementById('f-apoio').value,
+    prazo:            prazoVal ? firebase.firestore.Timestamp.fromDate(new Date(prazoVal + 'T12:00:00')) : null,
+    entregavel:       document.getElementById('f-entregavel').value,
+    observacoes:      document.getElementById('f-observacoes').value,
+    porcentoConcluido: pct,
+    atualizadoEm:     firebase.firestore.FieldValue.serverTimestamp(),
+    atualizadoPor:    currentUser?.displayName || currentUser?.email
+  };
+
+  if (data.status === 'Concluída' && pct >= 1) {
+    data.dataConclusao = firebase.firestore.FieldValue.serverTimestamp();
+  }
+
+  try {
+    const btn = document.getElementById('btn-salvar');
+    btn.disabled = true; btn.textContent = 'Salvando…';
+
+    if (editingId) {
+      await db.collection('demandas').doc(editingId).update(data);
+      toast('Demanda atualizada com sucesso!');
+    } else {
+      data.criadoEm = firebase.firestore.FieldValue.serverTimestamp();
+      data.criadoPor = currentUser?.displayName || currentUser?.email;
+      await db.collection('demandas').add(data);
+      toast('Demanda criada com sucesso!');
+    }
+    fecharModal('modal-form');
+  } catch (err) {
+    toast('Erro ao salvar: ' + err.message, 'error');
+  } finally {
+    const btn = document.getElementById('btn-salvar');
+    btn.disabled = false; btn.textContent = 'Salvar';
+  }
+}
+
+// ── Detalhe ────────────────────────────────────────────────
+function abrirDetalhe(id) {
+  const d = allDemandas.find(x => x.id === id);
+  if (!d) return;
+
+  document.getElementById('det-titulo').textContent     = d.titulo || '—';
+  document.getElementById('det-atividade').textContent  = d.atividade || '—';
+  document.getElementById('det-descricao').textContent  = d.descricao || '—';
+  document.getElementById('det-area').textContent       = d.area || '—';
+  document.getElementById('det-tipo').textContent       = d.tipo || '—';
+  document.getElementById('det-responsavel').textContent = d.responsavel || '—';
+  document.getElementById('det-apoio').textContent      = d.apoio || '—';
+  document.getElementById('det-abertura').textContent   = fmt(d.criadoEm);
+  document.getElementById('det-prazo').textContent      = fmt(d.prazo);
+  document.getElementById('det-conclusao').textContent  = fmt(d.dataConclusao);
+  document.getElementById('det-entregavel').textContent = d.entregavel || '—';
+  document.getElementById('det-obs').textContent        = d.observacoes || '—';
+  document.getElementById('det-prioridade').innerHTML   = badgePrioridade(d.prioridade);
+  document.getElementById('det-status').innerHTML       = badgeStatus(d.status);
+
+  const pct = Math.round((d.porcentoConcluido || 0) * 100);
+  const color = pct >= 100 ? 'var(--green)' : pct >= 50 ? 'var(--accent)' : 'var(--amber)';
+  document.getElementById('det-progress-fill').style.width = pct + '%';
+  document.getElementById('det-progress-fill').style.background = color;
+  document.getElementById('det-progress-pct').textContent = pct + '%';
+
+  document.getElementById('btn-det-editar').onclick = () => {
+    fecharModal('modal-detalhe');
+    abrirFormulario(id);
+  };
+  document.getElementById('btn-det-excluir').onclick = () => confirmarExcluir(id, d.titulo);
+
+  document.getElementById('modal-detalhe').classList.add('open');
+}
+
+async function confirmarExcluir(id, titulo) {
+  if (!confirm(`Excluir a demanda "${titulo}"? Esta ação não pode ser desfeita.`)) return;
+  try {
+    await db.collection('demandas').doc(id).delete();
+    fecharModal('modal-detalhe');
+    toast('Demanda excluída');
+  } catch (err) {
+    toast('Erro ao excluir: ' + err.message, 'error');
+  }
+}
+
+function fecharModal(id) {
+  document.getElementById(id)?.classList.remove('open');
+}
+
+// ── Init ───────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  initAuth();
+
+  // Navegação
+  document.querySelectorAll('.nav-item').forEach(el => {
+    el.addEventListener('click', () => navigate(el.dataset.page));
+  });
+
+  // Filtros em tempo real
+  ['f-busca','f-area','f-status','f-prioridade'].forEach(id => {
+    document.getElementById(id)?.addEventListener('input', () => renderTabela());
+  });
+
+  // Slider de %
+  document.getElementById('f-pct')?.addEventListener('input', function() {
+    document.getElementById('f-pct-display').textContent = this.value + '%';
+  });
+
+  // Fechar modal clicando fora
+  document.querySelectorAll('.modal-overlay').forEach(el => {
+    el.addEventListener('click', e => { if (e.target === el) el.classList.remove('open'); });
+  });
+});
